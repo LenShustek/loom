@@ -10,7 +10,7 @@ The hardware added to the loom consists of:
  - up to 8 stepper motors, 23HS22-1504S, NEMA 23, 5.4V, 1.5A, 164 oz-in holding torque
  - up to 8 DRV8825 stepper motor drivers (Pololu or equiv.)
  - a 24VDC 200W power supply
- - 25-pitch sprokets and roller chain to connect the motors to the shaft lines
+ - 25-pitch sprockets and roller chain to connect the motors to the shaft lines
  - a control box that contains:
    - 1 4-row x 20-character LCD display (Adafruit 198)
    - 1 4-digit 7-segment I2C big digit numerical display (Adafruit 1268)
