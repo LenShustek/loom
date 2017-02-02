@@ -13,7 +13,7 @@
     - 1 foot pedal (MPJA 18150 or equiv.)
     - 1 Teensy 3.5 microprocessor, with 512KB flash, 192KB RAM, 4KB EEPROM, and 40 I/O pins
 
-  ------------------------------------------------------------------------------------------------------
+   ------------------------------------------------------------------------------------------------------
    Copyright (c) 2017, Len Shustek
 
    The MIT License (MIT)
@@ -35,11 +35,12 @@
 
 ******************************************************************************************************/
 /*
-   23 Jan 2017, L. Shustek, first version
+   23 Jan 2017, L. Shustek, V1.0, first version
+   31 Jan 2017, L. Shustek, V1.1, fix treadle sequence changes during weaving,
+                                  clean up filename handling and display
 */
 
 /* TODO:
-    fix trailing blanks on filename
     add motor driver fault detect
 */
 
@@ -163,7 +164,7 @@ static byte treadle_sequence[MAX_SEQUENCE]; // treadle sequence for this pattern
 #define UNUSED_SEQ 0xff                     // or 0xff signifying "this position is unused"
 static int sequence_size;
 
-//**** file format in EEPROM
+//**** EEPROM format for persistent data
 
 #define EEPROM_SIZE 4096
 /* layout is:
@@ -178,7 +179,7 @@ static int sequence_size;
 struct {
    char id[4];       // "cfg" for identification
    int size;         // size of the config record, including this header
-   int numshafts;    // compile-time config parameters
+   int numshafts;    // compile-time config parameters for consistency checking
    int numtreadles;
    int maxsequence;
    byte lastfilenum;  // the last file we loaded or saved
@@ -670,6 +671,13 @@ void read_config(void) {
    else write_config(0); // bad config in EEPROM: rewrite it
 }
 
+void cleanup_filename (char *name) {
+   name[MAX_FILENAME] = '\0';  // ensure the null ending
+   for (int i = MAX_FILENAME - 1; i >= 0; --i) {
+      if (name[i] == ' ') name[i] = '\0';  // remove trailing blanks
+      else if (name[i] != '\0') break;  // stop at first non-blank, non-null character
+   } }
+
 void write_file (int filenum) {
    int toloc = CONFIG_SIZE + filenum * FILE_SIZE;
    int checksum = 0;
@@ -693,11 +701,11 @@ void read_file_hdr (int filenum) {
       assert (file_hdr.size == FILE_SIZE, "bad file size");
       for (int i = 0; i < sizeof(file_hdr); ++i)
          checksum += ((char *)&file_hdr) [ i];
-      assert(checksum == 0, "bad file checksum"); }
+      assert(checksum == 0, "bad file checksum");
+      cleanup_filename(file_hdr.filename); }
    else { // damaged or never-used header: make it look good
       strcpy (file_hdr.id, "fil");
-      memset(file_hdr.filename, ' ', MAX_FILENAME);
-      file_hdr.filename[MAX_FILENAME] = 0;
+      memset(file_hdr.filename, '\0', MAX_FILENAME + 1);
       file_hdr.size = FILE_SIZE; } }
 
 void read_file_data (int filenum) {
@@ -771,7 +779,12 @@ void loadsave_files (void) {
                   row_select = false;
                   lcd.noCursor();
                   lcd.blink(); }
-               else if (charnum < MAX_FILENAME) ++charnum; }
+               else if (charnum < MAX_FILENAME) {
+                  ++charnum;
+                  if (file_hdr.filename[charnum] == '\0') // if we're going beyond the end
+                     file_hdr.filename[charnum] = ' '; // change to a blank
+                  file_hdr.filename[charnum + 1] = '\0'; // and make a new end
+               } }
             break;
          case eVrotR:  // move down
             if (!save || row_select) {
@@ -806,6 +819,7 @@ update_letter:
          case ePBH: // left (horizontal) button
             if (save) {
                if (row_select) { // write this file
+                  cleanup_filename(file_hdr.filename);
                   write_file(filenum);
                   info_message("file saved:", file_hdr.filename);
                   if (DEBUG) dump_file();
@@ -875,7 +889,7 @@ do_step:
    H_LED(0);
    V_LED(0); }
 
-void do_treadle(int treadle) { // queue up shaft motion for a treadle push
+void do_treadle(int treadle) { // queue up and then do the shaft motion for a treadle push
    #if DEBUG
    Serial.print("treadle "); Serial.print(treadle); Serial.print(": ");
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
@@ -981,14 +995,17 @@ void weave (void) {
    int position = 0;
    int shuttle_count = 0;
    enum events event;
+   bool before_movement = true; // we haven't yet moved to the position shown on the screen
+
    digitalWrite(MOTOR_ENB, LOW);  // enable the motors
    if (wait_yesno("shed must be closed", "do calibration?"))
       do_calibration();
-   lcd.clear();
-   center_message(0, "ready to weave");
-   center_message(3, "press pedal");
    Serial.println("weaving");
+   lcd.clear();
+   lcd.blink();
    V_LED(V_ENC_BLUE);
+   display_treadle_sequence(position, false);  // show the position we are about to move to
+   lcd.setCursor(0, 0);  // indicate that by putting the cursor before the number
    led7_shownum(shuttle_count, true);
    while (1) {// do the treadle sequence
       event = check_event();
@@ -1002,14 +1019,15 @@ void weave (void) {
             center_all_shafts();  // close the shed
             digitalWrite(MOTOR_ENB, HIGH);  // and disable the motors
             return;
-         case ePEDAL:
-            if (treadle_sequence[position] != UNUSED_SEQ) {
+         case ePEDAL:  // next in treadle sequence
+            if (!before_movement) {  // we need to move to a new position
+               if (++position >= sequence_size) position = 0;
                display_treadle_sequence(position, false);
-               lcd.setCursor(2, 0);
-               lcd.blink();
+               led7_shownum(++shuttle_count, true); }
+            lcd.setCursor(2, 0); // indicate that we have moved to that position
+            if (treadle_sequence[position] != UNUSED_SEQ) {
                do_treadle(treadle_sequence[position]); }
-            led7_shownum(++shuttle_count, true);
-            if (++position >= sequence_size) position = 0;
+            before_movement = false;
             break;
          case ePB4:
             shuttle_count = 0;
@@ -1019,12 +1037,13 @@ void weave (void) {
             if (--position < 0) position = sequence_size - 1;
             if (shuttle_count > 0) --shuttle_count;
             goto new_position;
-            break;
          case eVrotR:  // go down (forwards) in treadle sequence
             if (++position >= sequence_size) position = 0;
             ++shuttle_count;
 new_position:
+            before_movement = true;
             display_treadle_sequence(position, false);
+            lcd.setCursor(0, 0); // indicate that we are display a position we aren't at
             led7_shownum(shuttle_count, true);
             break;
          default: ; } } }
@@ -1075,6 +1094,7 @@ void setup(void) {
    if (config_hdr.lastfilenum < MAX_FILES) {
       read_file_hdr(config_hdr.lastfilenum);
       read_file_data(config_hdr.lastfilenum);
+      cleanup_treadle_sequence();
       info_message("file reloaded:", file_hdr.filename); } }
 
 //**** the main loop
