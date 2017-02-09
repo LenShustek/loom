@@ -38,14 +38,33 @@
    23 Jan 2017, L. Shustek, V1.0, first version
    31 Jan 2017, L. Shustek, V1.1, fix treadle sequence changes during weaving,
                                   clean up filename handling and display
+    4 Feb 2017, L. Shustek, V1.2  add motor fault detection; fix filename bug;
+                                  fix schematic to match driver physical layout;
+                                  clean up compiler warnings.
 */
 
 /* TODO:
-    add motor driver fault detect
+    - Invent a more programmatic way to configure treadle sequences with repeat loops.
+      Since weaving is limited to one treadle at a time we can use decimal rather than unary
+      notation on the narrow display. It doesn't match weaving books, though, so weavers would
+      consider that sacriligious!
+      Idea #1: a third programming mode for "treadle loops", in addition to the traditional sequence.
+      The display might be like this, using "Irish Meadows blanket" as an example:
+          4x: 5 6
+          6x: 6 5
+          8x: 5 6
+          xx: 1 2 3 4
+          8x: 5 6
+          6x: 6 5
+          4x: 5 6
+      When weaving, the "xx" line would be repeated indefinitely until a button is pushed.
+      Either this "treadle loop" notation or a reconstructed "treadle sequence" notation could be displayed.
+      The 7-digit display could show how far along in a repeat sequence we are.
+      The file format would have to be elaborated to be able to save and load these looped treadle sequences.
 */
 
-#define VERSION "1.0"
-#define DEBUG true
+#define VERSION "1.2"
+#define DEBUG false
 #define HW_TEST false
 
 #include <Encoder.h>
@@ -56,7 +75,7 @@
 
 //**** global parameters
 
-#define NUM_TREADLES 16 // max 17 will fit on the display
+#define NUM_TREADLES 16 // max 17 will fit on the display currently
 #define NUM_SHAFTS 8
 #define MAX_SEQUENCE 32
 
@@ -76,10 +95,10 @@
 #define LCD_ENB 12
 #define LCD_RS 24
 #define LCD_RW 7
-#define PB1 3  // pushbuttons: active low (top, blue)
+#define PB1 3  // pushbuttons: active low (blue)
 #define PB2 2  //   (yellow)
 #define PB3 1  //   (green)
-#define PB4 0  //   (bottom, black)
+#define PB4 0  //   (black)
 #define PEDAL 6
 #define MOTOR_DIR 21    // direction control for all motors
 #define MOTOR_ENB 22    // active low: enable motors
@@ -109,7 +128,6 @@ enum events { // input events
    ePB1, ePB2, ePB3, ePB4,  // big pushbuttons
    ePBH, ePBV,              // horizontal and vertical encoder pushbuttons
    ePEDAL,                  // foot pedal
-   eFAULT,                  // motor driver fault
    eHrotL, eHrotR,          // horizontal encoder rotation
    eVrotL, eVrotR           // vertical encoder rotation
 };
@@ -125,7 +143,6 @@ inpins[] = {
    { H_ENC_PB, ePBH, HIGH },
    { V_ENC_PB, ePBV, HIGH },
    {PEDAL, ePEDAL, LOW },
-   {MOTOR_FAULT, eFAULT, LOW },
    {0xff } };
 
 static byte lightpins[] = { // output pins for encoder LEDs
@@ -143,19 +160,20 @@ static struct {
    int steps_to_move;   // how many steps up (pos) or down (neg) are left to move
 }
 shafts[NUM_SHAFTS] = {
-   {13, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {14, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
+   {16, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },  // top front motor
    {15, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {16, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {17, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
+   {14, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
+   {13, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },  // bottom front motor
+   {17, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 }, // bottom back motor
    {18, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
    {19, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {20, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 } };
+   {20, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 }  // top back motor
+};
 
 // weaving configuration
 
 static bool tieup [NUM_SHAFTS] [NUM_TREADLES] =  { // does shaft i go down with treadle j?
-   // initialization: a line is all treadles connected to a shaft
+   // initialization: a line is all treadles connected to a particular shaft
    {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
    {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -186,7 +204,7 @@ struct {
    byte unused[15];
    // after this we write the "shafts" array, which contains the shaft configuration data
 } config_hdr;
-#define CONFIG_SIZE (sizeof(config_hdr) + sizeof(shafts))
+#define CONFIG_SIZE ((int)sizeof(config_hdr) + (int)sizeof(shafts))
 
 #define MAX_FILENAME 15
 struct {
@@ -196,10 +214,10 @@ struct {
    char filename[MAX_FILENAME + 1]; // null-terminated string
    // after this we write the tieup array, followed by the treadle_sequence vector
 } file_hdr;
-#define FILE_SIZE (sizeof(file_hdr) + sizeof(tieup) + sizeof(treadle_sequence))
+#define FILE_SIZE ((int)sizeof(file_hdr) + (int)sizeof(tieup) + (int)sizeof(treadle_sequence))
 #define MAX_FILES ((EEPROM_SIZE - CONFIG_SIZE) / FILE_SIZE)
 // The current implementation assumes all files are padded to the fixed maximum size.
-// All stored files break if NUM_SHAFTS, NUM_TREADLES, or MAX_SEQUENCE are changed!
+// All stored files will break if NUM_SHAFTS, NUM_TREADLES, or MAX_SEQUENCE is changed!
 
 //**** global variables
 
@@ -265,22 +283,9 @@ void V_LED (int led) {
 //**** big 7-sgement LED display routines
 
 static const uint8_t numbertable[] = {
-   0x3F, /* 0 */
-   0x06, /* 1 */
-   0x5B, /* 2 */
-   0x4F, /* 3 */
-   0x66, /* 4 */
-   0x6D, /* 5 */
-   0x7D, /* 6 */
-   0x07, /* 7 */
-   0x7F, /* 8 */
-   0x6F, /* 9 */
-   0x77, /* a */
-   0x7C, /* b */
-   0x39, /* C */
-   0x5E, /* d */
-   0x79, /* E */
-   0x71, /* F */
+   0x3F, /* 0 */  0x06, /* 1 */  0x5B, /* 2 */  0x4F, /* 3 */  0x66, /* 4 */
+   0x6D, /* 5 */  0x7D, /* 6 */  0x07, /* 7 */  0x7F, /* 8 */  0x6F, /* 9 */
+   0x77, /* a */  0x7C, /* b */  0x39, /* C */  0x5E, /* d */  0x79, /* E */  0x71, /* F */
 };
 uint16_t displaybuffer[8];
 
@@ -378,7 +383,7 @@ enum events check_event(void) {
       return eVrotR; }
    return eNone; }
 
-bool wait_yesno(char *msg1, char *msg2) {
+bool wait_yesno(const char *msg1, const char *msg2) {
    enum events event;
    bool answer;
    lcd.clear();
@@ -400,7 +405,7 @@ bool wait_yesno(char *msg1, char *msg2) {
    lcd.clear();
    return answer; }
 
-int ask_choice(char *msg1, char *msg2, char *msg3, char *msg4) {
+int ask_choice(const char *msg1, const char *msg2, const char *msg3, const char *msg4) {
    enum events event;
    int row = 0, numchoices = 2;
    lcd.clear();
@@ -549,8 +554,8 @@ void program_treadle_sequence(void) {
    bool show_title = true;
    bool row_select = false;  // are we selecting the whole row by having the cursor on the far left?
    enum events event;
-   digitalWrite(H_ENC_GREEN, LED_ON);
-   digitalWrite(V_ENC_RED, LED_ON);
+   H_LED(H_ENC_GREEN);
+   V_LED(V_ENC_RED);
    while (1) {
       display_treadle_sequence(sequence_pos_on_top, show_title);
       lcd.setCursor(row_select ? 0 : treadle_num + 3,
@@ -580,7 +585,7 @@ void program_treadle_sequence(void) {
                lcd.noBlink();
                lcd.cursor();
                H_LED(H_ENC_GREEN);
-               V_LED(V_ENC_GREEN); }
+               V_LED(V_ENC_RED); }
             else if (treadle_num < NUM_TREADLES - 1) ++treadle_num;
             break;
          case eVrotR:  // move down
@@ -597,20 +602,20 @@ move_down:
                if (sequence_pos < sequence_pos_on_top) {// scroll down
                   --sequence_pos_on_top; } }
             break;
-         case ePBH: // green (left, horizontal) button
+         case ePBH: // green or blue (left, horizontal) button
             if (row_select) insert_treadle_sequence(sequence_pos);
             else {
                treadle_sequence[sequence_pos] = treadle_num;  // assign the treadle to this position
                goto move_down; }
             break;
-         case ePBV:  /// red (right, vertical) button
+         case ePBV:  // red (right, vertical) button
             if (row_select) delete_treadle_sequence(sequence_pos);
             else {
                if (treadle_sequence[sequence_pos] == treadle_num)  // if we're on this treadle
                   treadle_sequence[sequence_pos] = UNUSED_SEQ; // remove it
             }
             break;
-         case ePB1:  // top button: stop programming
+         case ePB1:  // program button: stop programming
             H_LED(0);
             V_LED(0);
             lcd.noBlink();
@@ -621,7 +626,6 @@ move_down:
 
 // file routines
 
-#if DEBUG
 void dump_file (void) {
    Serial.print(file_hdr.id); Serial.print(", ");
    Serial.print(file_hdr.size); Serial.print(" bytes, checksum "); Serial.println(" checksum");
@@ -635,7 +639,6 @@ void dump_file (void) {
    for (int tr = 0; tr < sequence_size; ++tr) {
       Serial.print(treadle_sequence[tr]); Serial.print(' '); }
    Serial.println(); }
-#endif
 
 void read_EEPROM (int *fromloc, char * ptr, int count) {
    while (count--)
@@ -672,11 +675,15 @@ void read_config(void) {
 }
 
 void cleanup_filename (char *name) {
-   name[MAX_FILENAME] = '\0';  // ensure the null ending
-   for (int i = MAX_FILENAME - 1; i >= 0; --i) {
+   int i;
+   name[MAX_FILENAME] = '\0';  // ensure a null ending
+   for (i = MAX_FILENAME - 1; i >= 0; --i) {
       if (name[i] == ' ') name[i] = '\0';  // remove trailing blanks
       else if (name[i] != '\0') break;  // stop at first non-blank, non-null character
-   } }
+   }
+   for ( ; i >= 0; --i)
+      if (name[i] == '\0') name[i] = ' '; // convert any other embedded nulls to blanks.
+}
 
 void write_file (int filenum) {
    int toloc = CONFIG_SIZE + filenum * FILE_SIZE;
@@ -685,7 +692,7 @@ void write_file (int filenum) {
    strcpy (file_hdr.id, "fil");
    file_hdr.size = FILE_SIZE;
    file_hdr.checksum = 0;
-   for (int i = 0; i < sizeof(file_hdr); ++i)
+   for (unsigned int i = 0; i < sizeof(file_hdr); ++i)
       checksum += ((char *)&file_hdr) [ i];
    file_hdr.checksum = -checksum;
    write_EEPROM(&toloc, (char*) &file_hdr, sizeof(file_hdr));
@@ -699,7 +706,7 @@ void read_file_hdr (int filenum) {
    if (strcmp(file_hdr.id, "fil") == 0) { // it's a file
       byte checksum = 0;
       assert (file_hdr.size == FILE_SIZE, "bad file size");
-      for (int i = 0; i < sizeof(file_hdr); ++i)
+      for (unsigned int i = 0; i < sizeof(file_hdr); ++i)
          checksum += ((char *)&file_hdr) [ i];
       assert(checksum == 0, "bad file checksum");
       cleanup_filename(file_hdr.filename); }
@@ -709,7 +716,7 @@ void read_file_hdr (int filenum) {
       file_hdr.size = FILE_SIZE; } }
 
 void read_file_data (int filenum) {
-   int fromloc = CONFIG_SIZE + filenum * FILE_SIZE + sizeof(file_hdr);
+   int fromloc = CONFIG_SIZE + filenum * FILE_SIZE + (int)sizeof(file_hdr);
    assert (filenum < MAX_FILES, "bad read_file_data");
    read_EEPROM(&fromloc, (char*) tieup, sizeof(tieup));
    read_EEPROM(&fromloc, (char*) treadle_sequence, sizeof(treadle_sequence)); }
@@ -724,21 +731,21 @@ void display_files (int filenum) {
       lcd.print(file_hdr.filename); } }
 
 char changeletter(char letter, bool forward) {
-   static char filenamechars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-,.<>?/";
+   static char filenamechars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-,.<>?/'";
    int ndx = 0; char *letterptr;
    if (letter != 0) { // 0 gets treated like blank
       assert ((letterptr = strchr(filenamechars, letter )) != NULL, "bad filename char");
       ndx = letterptr - filenamechars; }
    if (forward) { // forwards in lexical order
-      if (++ndx >= sizeof(filenamechars) - 1) ndx = 0; }
+      if (++ndx >= (int)sizeof(filenamechars) - 1) ndx = 0; }
    else { // backwards in lexical order
-      if (--ndx < 0) ndx = sizeof(filenamechars) - 2; }
+      if (--ndx < 0) ndx = (int)sizeof(filenamechars) - 2; }
    return filenamechars[ndx]; }
 
 void loadsave_files (void) {
    int filenum = 0, filenum_on_top = 0, charnum = 0, choice;
    bool row_select = true; // are we selecting the whole row by having the cursor on the far left?
-   bool name_changed, save;
+   bool save;
    enum events event;
 
    choice = ask_choice("load file?", "save file?", "erase memory?", 0);
@@ -812,7 +819,6 @@ void loadsave_files (void) {
                file_hdr.filename[charnum] = changeletter(file_hdr.filename[charnum], false);
 update_letter:
                lcd.write(file_hdr.filename[charnum]);
-               name_changed = true;
                lcd.setCursor(3 + charnum, filenum - filenum_on_top); // restore cursor position
             }
             break;
@@ -865,6 +871,7 @@ void do_steps() {  // do queued-up steps for all motors
    bool step_done;
    digitalWrite(H_ENC_BLUE, LOW);
    digitalWrite(V_ENC_BLUE, LOW);
+   assert(digitalRead(MOTOR_FAULT) == HIGH, "motor failure");
    do {
       step_done = false;
       for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
@@ -884,7 +891,8 @@ do_step:
             delayMicroseconds(5);
             step_done = true; } }
       if (step_done)
-         delayMicroseconds(MIN_STEP_uSEC); }
+         delayMicroseconds(MIN_STEP_uSEC);
+      assert(digitalRead(MOTOR_FAULT) == HIGH, "motor failure"); }
    while (step_done);
    H_LED(0);
    V_LED(0); }
@@ -939,7 +947,7 @@ int get_calibration(int shaft, const char *msg, bool allow_abort) {  // calibrat
          digitalWrite(MOTOR_DIR, shafts[shaft].clockwise); // set direction to "up"
          stepadj = +1;
 do_move:
-         for (int num_moves = 0; num_moves < uSTEPS_PER_STEP; ++num_moves) {  // do all microsteps of a step
+         for (int num_moves = 0; num_moves < uSTEPS_PER_STEP; ++num_moves) {  // do all microsteps of a full original step
             delayMicroseconds(5);
             digitalWrite(shafts[shaft].pin_step, HIGH); // do one step
             delayMicroseconds(5);
@@ -966,14 +974,12 @@ void do_calibration(void) {  // calibrate the center, bottom, and top positions 
       shafts[shaft].steps_to_move = 0; }
    for (shaft = 0; shaft < NUM_SHAFTS; ++shaft) {  // now ask to recalibrate
       if (using_shaft(shaft)) {                    //  the shafts in use for this pattern
-         if (get_calibration(shaft, "center", true) != 999) { // not doing this shaft
+         if (get_calibration(shaft, "center", true) != 999) { // not calibrating this shaft
             shafts[shaft].steps_to_down = -get_calibration(shaft, "down", false);
-            shafts[shaft].steps_to_up = get_calibration(shaft, "up", false) - shafts[shaft].steps_to_down;
+            shafts[shaft].steps_to_move = shafts[shaft].steps_to_down; // return it to the center
+            do_steps();  // (it will be the only motor to move)
+            shafts[shaft].steps_to_up = get_calibration(shaft, "up", false);
             shafts[shaft].steps_to_move = -shafts[shaft].steps_to_up; // return it to the center
-            if (DEBUG) {
-               Serial.print("dn:"); Serial.print(shafts[shaft].steps_to_down);
-               Serial.print(" up:"); Serial.print(shafts[shaft].steps_to_up);
-               Serial.print(" do:"); Serial.println(shafts[shaft].steps_to_move); }
             do_steps(); // (it will be the only motor to move)
          } } }
    write_config(config_hdr.lastfilenum); // write the shaft calibration data
@@ -987,6 +993,9 @@ void center_all_shafts(void) {
                break;
             case SHAFT_DOWN:
                shafts[shaft].steps_to_move = shafts[shaft].steps_to_down;
+               break;
+            case SHAFT_CENTER:
+               shafts[shaft].steps_to_move = 0;
                break; }
       shafts[shaft].shaft_position = SHAFT_CENTER; }
    do_steps(); }
@@ -998,6 +1007,7 @@ void weave (void) {
    bool before_movement = true; // we haven't yet moved to the position shown on the screen
 
    digitalWrite(MOTOR_ENB, LOW);  // enable the motors
+   assert(digitalRead(MOTOR_FAULT) == HIGH, "motor failure");
    if (wait_yesno("shed must be closed", "do calibration?"))
       do_calibration();
    Serial.println("weaving");
@@ -1062,14 +1072,15 @@ void setup(void) {
       pinMode(shafts[shaft].pin_step, OUTPUT);
    pinMode(MOTOR_DIR, OUTPUT);
    pinMode(MOTOR_ENB, OUTPUT);
+   pinMode(MOTOR_FAULT, INPUT_PULLUP);
    digitalWrite(MOTOR_ENB, HIGH); // disable motors
-   for (int i = 0; inpins[i].pin != 0xff; ++i) { // configure all inputs
+   for (int i = 0; inpins[i].pin != 0xff; ++i) { // configure all user inputs
       pinMode (inpins[i].pin, INPUT_PULLUP); }
    Vold = V_ENC.read();
    Hold = H_ENC.read();
    for (int i = 0; lightpins[i] != 0xff; ++i) { // configure the lights
       pinMode(lightpins[i], OUTPUT);
-      digitalWrite(lightpins[i], HIGH); // active low
+      digitalWrite(lightpins[i], HIGH); // turn off (active low)
    }
    lcd.begin(20, 4); // start LCD display
    if (DEBUG) Serial.println("LCD started");
