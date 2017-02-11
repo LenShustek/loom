@@ -35,12 +35,16 @@
 
 ******************************************************************************************************/
 /*
-   23 Jan 2017, L. Shustek, V1.0, first version
-   31 Jan 2017, L. Shustek, V1.1, fix treadle sequence changes during weaving,
-                                  clean up filename handling and display
-    4 Feb 2017, L. Shustek, V1.2  add motor fault detection; fix filename bug;
-                                  fix schematic to match driver physical layout;
-                                  clean up compiler warnings.
+   23 Jan 2017, L. Shustek, V1.0, - first version
+   31 Jan 2017, L. Shustek, V1.1, - fix treadle sequence changes during weaving,
+                                  - clean up filename handling and display
+    4 Feb 2017, L. Shustek, V1.2  - add motor fault detection
+                                  - fix filename bug
+                                  - change schematic to match driver physical layout;
+                                  - clean up compiler warnings
+   10 Feb 2017, L. Shustek, V1.3  - separate motor hardware config, and don't write it to memory
+                                  - better debugging output
+   
 */
 
 /* TODO:
@@ -63,8 +67,8 @@
       The file format would have to be elaborated to be able to save and load these looped treadle sequences.
 */
 
-#define VERSION "1.2"
-#define DEBUG false
+#define VERSION "1.3"
+#define DEBUG true
 #define HW_TEST false
 
 #include <Encoder.h>
@@ -149,25 +153,37 @@ static byte lightpins[] = { // output pins for encoder LEDs
    H_ENC_RED, H_ENC_GREEN, H_ENC_BLUE,
    V_ENC_RED, V_ENC_GREEN, V_ENC_BLUE, 0xff };
 
+static struct  { // output pins for the stepper motors
+   byte pin_step;       // what pin starts a step for this motor
+   bool clockwise;      // is clockwise up?
+} shaft_hardware[NUM_SHAFTS] = {
+   {16, true },  // top front motor
+   {15, true },
+   {14, true },
+   {13, true },  // bottom front motor
+   {17, false }, // bottom back motor
+   {18, false },
+   {19, false },
+   {20, false }  // top back motor
+};
+
 enum shaft_positions {SHAFT_CENTER, SHAFT_UP, SHAFT_DOWN };
 #define NOMINAL_STEPS ((ROTATION_PERCENT * STEPS_PER_ROTATION) / 100)
 static struct {
-   byte pin_step;       // what pin starts a step for this motor
-   bool clockwise;      // is clockwise up?
    enum shaft_positions shaft_position;  // where is the shaft currently?
    int steps_to_down;   // how many steps move from center to down
    int steps_to_up;     // how many steps move from center to up
    int steps_to_move;   // how many steps up (pos) or down (neg) are left to move
 }
-shafts[NUM_SHAFTS] = {
-   {16, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },  // top front motor
-   {15, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {14, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {13, true, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },  // bottom front motor
-   {17, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 }, // bottom back motor
-   {18, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {19, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
-   {20, false, SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 }  // top back motor
+shaft_status[NUM_SHAFTS] = {
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },  // top front motor
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },  // bottom front motor
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },  // bottom back motor
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 },
+   {SHAFT_CENTER,  NOMINAL_STEPS,  NOMINAL_STEPS, 0 }   // top back motor
 };
 
 // weaving configuration
@@ -187,7 +203,7 @@ static int sequence_size;
 #define EEPROM_SIZE 4096
 /* layout is:
      config_hdr
-     shafts []
+     shaft_status []
      repeat {
         file_hdr
         tieup []
@@ -202,9 +218,9 @@ struct {
    int maxsequence;
    byte lastfilenum;  // the last file we loaded or saved
    byte unused[15];
-   // after this we write the "shafts" array, which contains the shaft configuration data
+   // after this we write the "shaft_status" array, which contains the current shaft configuration data
 } config_hdr;
-#define CONFIG_SIZE ((int)sizeof(config_hdr) + (int)sizeof(shafts))
+#define CONFIG_SIZE ((int)sizeof(config_hdr) + (int)sizeof(shaft_status))
 
 #define MAX_FILENAME 15
 struct {
@@ -464,7 +480,7 @@ void display_treadle_sequence(int /*starting*/ sequence_pos, bool title) {
       center_message(row, "Treadle sequence");
       ++row; }
    for (; row <= 3 && sequence_pos < MAX_SEQUENCE; ++row, ++sequence_pos) {
-      int treadle = treadle_sequence[sequence_pos];
+      byte treadle = treadle_sequence[sequence_pos];
       center_message(row, "");
       lcd.setCursor(0, row);
       lcd_write_dd(sequence_pos + 1);
@@ -626,7 +642,8 @@ move_down:
 
 // file routines
 
-void dump_file (void) {
+void dump_file (const char *msg) {
+   Serial.println(msg);
    Serial.print(file_hdr.id); Serial.print(", ");
    Serial.print(file_hdr.size); Serial.print(" bytes, checksum "); Serial.println(" checksum");
    Serial.print("name:"); Serial.println(file_hdr.filename);
@@ -635,10 +652,19 @@ void dump_file (void) {
       for (int tr = 0; tr < NUM_TREADLES; ++tr) {
          Serial.print(tieup[sh][tr]); Serial.print(' '); }
       Serial.println(); }
-   Serial.print("treadle sequence:");
+   Serial.print("treadle sequence: ");
    for (int tr = 0; tr < sequence_size; ++tr) {
       Serial.print(treadle_sequence[tr]); Serial.print(' '); }
    Serial.println(); }
+
+void dump_shaft_state(void) {
+   static char *position_name[3] = {  " CT ", " UP ", " DN " };
+   Serial.println("shaft state:");
+   for (int sh = 0; sh < NUM_SHAFTS; ++sh) {
+      Serial.print(sh);  Serial.print(position_name[shaft_status[sh].shaft_position]);
+      Serial.print(shaft_status[sh].steps_to_down); Serial.print(", ");
+      Serial.print(shaft_status[sh].steps_to_up); Serial.print(", ");
+      Serial.print(shaft_status[sh].steps_to_move); Serial.println(); } }
 
 void read_EEPROM (int *fromloc, char * ptr, int count) {
    while (count--)
@@ -647,6 +673,11 @@ void read_EEPROM (int *fromloc, char * ptr, int count) {
 void write_EEPROM(int *toloc, char * ptr, int count) {
    while (count--) {
       EEPROM.write((*toloc)++, *ptr++); } }
+
+void erase_EEPROM(void) {
+   if (wait_yesno(0, "delete all files?")) {
+      for (int loc = 0; loc < EEPROM_SIZE; ++loc)
+         EEPROM.update(loc, 0); } }
 
 void write_config(int filenum) {
    int toloc = 0;
@@ -658,8 +689,9 @@ void write_config(int filenum) {
    config_hdr.lastfilenum = filenum;
    memset(config_hdr.unused, 0, sizeof(config_hdr.unused));
    write_EEPROM(&toloc, (char *) &config_hdr, sizeof(config_hdr));
-   write_EEPROM(&toloc, (char *) shafts, sizeof(shafts));
-   if (DEBUG) Serial.println("***config written"); }
+   write_EEPROM(&toloc, (char *) shaft_status, sizeof(shaft_status));
+   if (DEBUG) Serial.println("***config written");
+   if (DEBUG) dump_shaft_state(); }
 
 void read_config(void) {
    int fromloc = 0;
@@ -669,8 +701,9 @@ void read_config(void) {
       assert (config_hdr.size == CONFIG_SIZE, "bad config size");
       assert (config_hdr.numshafts == NUM_SHAFTS && config_hdr.numtreadles == NUM_TREADLES
               && config_hdr.maxsequence == MAX_SEQUENCE, "inconsistent config");
-      read_EEPROM(&fromloc, (char *) shafts, sizeof(shafts)); // read shaft data
-      if (DEBUG) Serial.println("***config read"); }
+      read_EEPROM(&fromloc, (char *) shaft_status, sizeof(shaft_status)); // read shaft data
+      if (DEBUG) Serial.println("***config read");
+      if (DEBUG) dump_shaft_state(); }
    else write_config(0); // bad config in EEPROM: rewrite it
 }
 
@@ -697,7 +730,8 @@ void write_file (int filenum) {
    file_hdr.checksum = -checksum;
    write_EEPROM(&toloc, (char*) &file_hdr, sizeof(file_hdr));
    write_EEPROM(&toloc, (char*) tieup, sizeof(tieup));
-   write_EEPROM(&toloc, (char*) treadle_sequence, sizeof(treadle_sequence)); }
+   write_EEPROM(&toloc, (char*) treadle_sequence, sizeof(treadle_sequence));
+   if (DEBUG) dump_file("file saved:"); }
 
 void read_file_hdr (int filenum) {
    int fromloc = CONFIG_SIZE + filenum * FILE_SIZE;
@@ -719,7 +753,9 @@ void read_file_data (int filenum) {
    int fromloc = CONFIG_SIZE + filenum * FILE_SIZE + (int)sizeof(file_hdr);
    assert (filenum < MAX_FILES, "bad read_file_data");
    read_EEPROM(&fromloc, (char*) tieup, sizeof(tieup));
-   read_EEPROM(&fromloc, (char*) treadle_sequence, sizeof(treadle_sequence)); }
+   read_EEPROM(&fromloc, (char*) treadle_sequence, sizeof(treadle_sequence));
+   cleanup_treadle_sequence();
+   if (DEBUG) dump_file("file read:"); }
 
 void display_files (int filenum) {
    lcd.clear();
@@ -750,9 +786,7 @@ void loadsave_files (void) {
 
    choice = ask_choice("load file?", "save file?", "erase memory?", 0);
    if (choice == 3) {
-      if (wait_yesno(0, "delete all files?")) {
-         for (int loc = 0; loc < EEPROM_SIZE; ++loc)
-            EEPROM.update(loc, 0); }
+      erase_EEPROM();
       return; }
    save = choice == 2;
    row_select = true;
@@ -828,7 +862,6 @@ update_letter:
                   cleanup_filename(file_hdr.filename);
                   write_file(filenum);
                   info_message("file saved:", file_hdr.filename);
-                  if (DEBUG) dump_file();
                   write_config(filenum); // record this file number in EEPROM
                   goto exit_loadsave; } }
             break;
@@ -841,9 +874,7 @@ update_letter:
                   goto exit_loadsave; } }
             else { // load file
                read_file_data(filenum);
-               cleanup_treadle_sequence();
                info_message("file loaded:", file_hdr.filename);
-               if (DEBUG) dump_file();
                write_config(filenum); // record this file number in EEPROM
                goto exit_loadsave; }
             break;
@@ -875,19 +906,19 @@ void do_steps() {  // do queued-up steps for all motors
    do {
       step_done = false;
       for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
-         if (shafts[shaft].steps_to_move < 0) { // moving down
-            digitalWrite(MOTOR_DIR, 1 - shafts[shaft].clockwise); // set direction to "down"
-            ++shafts[shaft].steps_to_move; // one fewer to do
+         if (shaft_status[shaft].steps_to_move < 0) { // moving down
+            digitalWrite(MOTOR_DIR, 1 - shaft_hardware[shaft].clockwise); // set direction to "down"
+            ++shaft_status[shaft].steps_to_move; // one fewer to do
             //Serial.print(shaft); Serial.println(" shaft down");
             goto do_step; }
-         if (shafts[shaft].steps_to_move > 0) { // moving up
-            digitalWrite(MOTOR_DIR, shafts[shaft].clockwise); // set direction to "up"
-            --shafts[shaft].steps_to_move;  // one fewer to do
+         if (shaft_status[shaft].steps_to_move > 0) { // moving up
+            digitalWrite(MOTOR_DIR, shaft_hardware[shaft].clockwise); // set direction to "up"
+            --shaft_status[shaft].steps_to_move;  // one fewer to do
             //Serial.print(shaft); Serial.println(" shaft up");
 do_step:
-            digitalWrite(shafts[shaft].pin_step, HIGH); // do a step on this shaft
+            digitalWrite(shaft_hardware[shaft].pin_step, HIGH); // do a step on this shaft
             delayMicroseconds(5);
-            digitalWrite(shafts[shaft].pin_step, LOW);
+            digitalWrite(shaft_hardware[shaft].pin_step, LOW);
             delayMicroseconds(5);
             step_done = true; } }
       if (step_done)
@@ -899,6 +930,7 @@ do_step:
 
 void do_treadle(int treadle) { // queue up and then do the shaft motion for a treadle push
    #if DEBUG
+   dump_shaft_state();
    Serial.print("treadle "); Serial.print(treadle); Serial.print(": ");
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
       Serial.print(shaft); Serial.print(tieup[shaft][treadle] ? " dn, " : " up, "); }
@@ -907,21 +939,21 @@ void do_treadle(int treadle) { // queue up and then do the shaft motion for a tr
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
       if (using_shaft(shaft)) {  // if we ever use this shaft in our pattern, then move it up or down
          if ( tieup[shaft] [treadle]) { // this shaft should go down
-            if (shafts[shaft].shaft_position == SHAFT_UP)
-               shafts[shaft].steps_to_move = -shafts[shaft].steps_to_down - shafts[shaft].steps_to_up;
-            if (shafts[shaft].shaft_position == SHAFT_CENTER)
-               shafts[shaft].steps_to_move = -shafts[shaft].steps_to_down; }
+            if (shaft_status[shaft].shaft_position == SHAFT_UP)
+               shaft_status[shaft].steps_to_move = -shaft_status[shaft].steps_to_down - shaft_status[shaft].steps_to_up;
+            if (shaft_status[shaft].shaft_position == SHAFT_CENTER)
+               shaft_status[shaft].steps_to_move = -shaft_status[shaft].steps_to_down; }
          else { // this shaft should go up
-            if (shafts[shaft].shaft_position == SHAFT_DOWN)
-               shafts[shaft].steps_to_move = shafts[shaft].steps_to_down + shafts[shaft].steps_to_up;
-            if (shafts[shaft].shaft_position == SHAFT_CENTER)
-               shafts[shaft].steps_to_move = shafts[shaft].steps_to_up;  }
+            if (shaft_status[shaft].shaft_position == SHAFT_DOWN)
+               shaft_status[shaft].steps_to_move = shaft_status[shaft].steps_to_down + shaft_status[shaft].steps_to_up;
+            if (shaft_status[shaft].shaft_position == SHAFT_CENTER)
+               shaft_status[shaft].steps_to_move = shaft_status[shaft].steps_to_up;  }
          if (DEBUG) {
             Serial.print("shaft "); Serial.print(shaft);
-            Serial.print(" moves "); Serial.println(shafts[shaft].steps_to_move); } } }
+            Serial.print(" moves "); Serial.println(shaft_status[shaft].steps_to_move); } } }
    do_steps();
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) // record the ending position of the shafts
-      shafts[shaft].shaft_position = tieup[shaft] [treadle] ? SHAFT_DOWN : SHAFT_UP; }
+      shaft_status[shaft].shaft_position = tieup[shaft] [treadle] ? SHAFT_DOWN : SHAFT_UP; }
 
 int get_calibration(int shaft, const char *msg, bool allow_abort) {  // calibrate the center, bottom, or top position of a shaft
    // returns the number of steps down (negative) or up (positive) we went, or 999 if aborted
@@ -940,18 +972,18 @@ int get_calibration(int shaft, const char *msg, bool allow_abort) {  // calibrat
    while (1) {
       event = check_event();
       if (event == eVrotR) {
-         digitalWrite(MOTOR_DIR, 1 - shafts[shaft].clockwise);  // set direction to "down"
+         digitalWrite(MOTOR_DIR, 1 - shaft_hardware[shaft].clockwise);  // set direction to "down"
          stepadj = -1;
          goto do_move; }
       if (event == eVrotL) {
-         digitalWrite(MOTOR_DIR, shafts[shaft].clockwise); // set direction to "up"
+         digitalWrite(MOTOR_DIR, shaft_hardware[shaft].clockwise); // set direction to "up"
          stepadj = +1;
 do_move:
          for (int num_moves = 0; num_moves < uSTEPS_PER_STEP; ++num_moves) {  // do all microsteps of a full original step
             delayMicroseconds(5);
-            digitalWrite(shafts[shaft].pin_step, HIGH); // do one step
+            digitalWrite(shaft_hardware[shaft].pin_step, HIGH); // do one step
             delayMicroseconds(5);
-            digitalWrite(shafts[shaft].pin_step, LOW);
+            digitalWrite(shaft_hardware[shaft].pin_step, LOW);
             delayMicroseconds(MIN_STEP_uSEC);
             steps += stepadj; } }
       if (allow_abort && event == ePBH) {
@@ -969,17 +1001,17 @@ do_exit:
 void do_calibration(void) {  // calibrate the center, bottom, and top positions of all shafts in use
    int shaft;
    for (shaft = 0; shaft < NUM_SHAFTS; ++shaft) {  // initialize all shafts as centered and nominal
-      shafts[shaft].shaft_position = SHAFT_CENTER;
-      shafts[shaft].steps_to_down = shafts[shaft].steps_to_up = NOMINAL_STEPS;
-      shafts[shaft].steps_to_move = 0; }
+      shaft_status[shaft].shaft_position = SHAFT_CENTER;
+      shaft_status[shaft].steps_to_down = shaft_status[shaft].steps_to_up = NOMINAL_STEPS;
+      shaft_status[shaft].steps_to_move = 0; }
    for (shaft = 0; shaft < NUM_SHAFTS; ++shaft) {  // now ask to recalibrate
       if (using_shaft(shaft)) {                    //  the shafts in use for this pattern
          if (get_calibration(shaft, "center", true) != 999) { // not calibrating this shaft
-            shafts[shaft].steps_to_down = -get_calibration(shaft, "down", false);
-            shafts[shaft].steps_to_move = shafts[shaft].steps_to_down; // return it to the center
+            shaft_status[shaft].steps_to_down = -get_calibration(shaft, "down", false);
+            shaft_status[shaft].steps_to_move = shaft_status[shaft].steps_to_down; // return it to the center
             do_steps();  // (it will be the only motor to move)
-            shafts[shaft].steps_to_up = get_calibration(shaft, "up", false);
-            shafts[shaft].steps_to_move = -shafts[shaft].steps_to_up; // return it to the center
+            shaft_status[shaft].steps_to_up = get_calibration(shaft, "up", false);
+            shaft_status[shaft].steps_to_move = -shaft_status[shaft].steps_to_up; // return it to the center
             do_steps(); // (it will be the only motor to move)
          } } }
    write_config(config_hdr.lastfilenum); // write the shaft calibration data
@@ -987,17 +1019,17 @@ void do_calibration(void) {  // calibrate the center, bottom, and top positions 
 
 void center_all_shafts(void) {
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
-      if (using_shaft(shaft)) switch (shafts[shaft].shaft_position) {
+      if (using_shaft(shaft)) switch (shaft_status[shaft].shaft_position) {
             case SHAFT_UP:
-               shafts[shaft].steps_to_move = -shafts[shaft].steps_to_up;
+               shaft_status[shaft].steps_to_move = -shaft_status[shaft].steps_to_up;
                break;
             case SHAFT_DOWN:
-               shafts[shaft].steps_to_move = shafts[shaft].steps_to_down;
+               shaft_status[shaft].steps_to_move = shaft_status[shaft].steps_to_down;
                break;
             case SHAFT_CENTER:
-               shafts[shaft].steps_to_move = 0;
+               shaft_status[shaft].steps_to_move = 0;
                break; }
-      shafts[shaft].shaft_position = SHAFT_CENTER; }
+      shaft_status[shaft].shaft_position = SHAFT_CENTER; }
    do_steps(); }
 
 void weave (void) {
@@ -1069,7 +1101,7 @@ void setup(void) {
    #endif
 
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft)
-      pinMode(shafts[shaft].pin_step, OUTPUT);
+      pinMode(shaft_hardware[shaft].pin_step, OUTPUT);
    pinMode(MOTOR_DIR, OUTPUT);
    pinMode(MOTOR_ENB, OUTPUT);
    pinMode(MOTOR_FAULT, INPUT_PULLUP);
@@ -1098,14 +1130,15 @@ void setup(void) {
    test_hardware();
    #endif
    if (DEBUG) {
-      dump_file();
+      if (digitalRead(PB4) == LOW) // magic: if black button is down during powerup
+        erase_EEPROM();            // then maybe erase the memory
+      dump_file( "initial state");
       Serial.print("config size:"); Serial.println(CONFIG_SIZE);
       Serial.print("file size:"); Serial.println(FILE_SIZE); }
    read_config();
    if (config_hdr.lastfilenum < MAX_FILES) {
       read_file_hdr(config_hdr.lastfilenum);
       read_file_data(config_hdr.lastfilenum);
-      cleanup_treadle_sequence();
       info_message("file reloaded:", file_hdr.filename); } }
 
 //**** the main loop
