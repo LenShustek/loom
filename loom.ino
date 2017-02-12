@@ -13,6 +13,10 @@
     - 1 foot pedal (MPJA 18150 or equiv.)
     - 1 Teensy 3.5 microprocessor, with 512KB flash, 192KB RAM, 4KB EEPROM, and 40 I/O pins
 
+   The software allow you to graphically configure the treadle tie-ups and the treadle sequence, 
+   and then weave by throwing the shuttle and then pusshing the single foot pedeal to get the
+   next configuration of the shafts.  The warping, though, must still be done manually!
+
    ------------------------------------------------------------------------------------------------------
    Copyright (c) 2017, Len Shustek
 
@@ -44,7 +48,8 @@
                                   - clean up compiler warnings
    10 Feb 2017, L. Shustek, V1.3  - separate motor hardware config, and don't write it to memory
                                   - better debugging output
-   
+                                  - parametrize CW/CCW motor initialization
+                                  - highlight the treadle while weaving, not just the line
 */
 
 /* TODO:
@@ -53,7 +58,7 @@
       notation on the narrow display. It doesn't match weaving books, though, so weavers would
       consider that sacriligious!
       Idea #1: a third programming mode for "treadle loops", in addition to the traditional sequence.
-      The display might be like this, using "Irish Meadows blanket" as an example:
+      The notation might be like this, using "Irish Meadows blanket" as an example:
           4x: 5 6
           6x: 6 5
           8x: 5 6
@@ -61,7 +66,7 @@
           8x: 5 6
           6x: 6 5
           4x: 5 6
-      When weaving, the "xx" line would be repeated indefinitely until a button is pushed.
+      When weaving, the "xx" line would be repeated indefinitely until a button is pushed to advance.
       Either this "treadle loop" notation or a reconstructed "treadle sequence" notation could be displayed.
       The 7-digit display could show how far along in a repeat sequence we are.
       The file format would have to be elaborated to be able to save and load these looped treadle sequences.
@@ -156,15 +161,17 @@ static byte lightpins[] = { // output pins for encoder LEDs
 static struct  { // output pins for the stepper motors
    byte pin_step;       // what pin starts a step for this motor
    bool clockwise;      // is clockwise up?
+#define FRONT_CW false  // (these depend on which way the chains are
+#define BACK_CW true    //  looped around the sprockets)
 } shaft_hardware[NUM_SHAFTS] = {
-   {16, true },  // top front motor
-   {15, true },
-   {14, true },
-   {13, true },  // bottom front motor
-   {17, false }, // bottom back motor
-   {18, false },
-   {19, false },
-   {20, false }  // top back motor
+   {16, FRONT_CW }, // top front motor
+   {15, FRONT_CW },
+   {14, FRONT_CW },
+   {13, FRONT_CW }, // bottom front motor
+   {17, BACK_CW },  // bottom back motor
+   {18, BACK_CW },
+   {19, BACK_CW },
+   {20, BACK_CW }   // top back motor
 };
 
 enum shaft_positions {SHAFT_CENTER, SHAFT_UP, SHAFT_DOWN };
@@ -1047,12 +1054,12 @@ void weave (void) {
    lcd.blink();
    V_LED(V_ENC_BLUE);
    display_treadle_sequence(position, false);  // show the position we are about to move to
-   lcd.setCursor(0, 0);  // indicate that by putting the cursor before the number
+   lcd.setCursor(0, 0);  // indicate that by putting the cursor before the sequence number
    led7_shownum(shuttle_count, true);
    while (1) {// do the treadle sequence
       event = check_event();
       switch (event) {
-         case ePB1:
+         case ePB1:  // any other button stops the weaving
          case ePB2:
          case ePB3:
             lcd.noBlink();
@@ -1066,12 +1073,13 @@ void weave (void) {
                if (++position >= sequence_size) position = 0;
                display_treadle_sequence(position, false);
                led7_shownum(++shuttle_count, true); }
-            lcd.setCursor(2, 0); // indicate that we have moved to that position
             if (treadle_sequence[position] != UNUSED_SEQ) {
+               lcd.setCursor(3 + treadle_sequence[position], 0); // indicate that we will have moved to that position
+               // by highlighting the treadle itself
                do_treadle(treadle_sequence[position]); }
             before_movement = false;
             break;
-         case ePB4:
+         case ePB4: // clear shuttle counter
             shuttle_count = 0;
             led7_shownum(shuttle_count, true);
             break;
@@ -1131,7 +1139,7 @@ void setup(void) {
    #endif
    if (DEBUG) {
       if (digitalRead(PB4) == LOW) // magic: if black button is down during powerup
-        erase_EEPROM();            // then maybe erase the memory
+         erase_EEPROM();            // then maybe erase the memory
       dump_file( "initial state");
       Serial.print("config size:"); Serial.println(CONFIG_SIZE);
       Serial.print("file size:"); Serial.println(FILE_SIZE); }
