@@ -13,7 +13,7 @@
     - 1 foot pedal (MPJA 18150 or equiv.)
     - 1 Teensy 3.5 microprocessor, with 512KB flash, 192KB RAM, 4KB EEPROM, and 40 I/O pins
 
-   The software allow you to graphically configure the treadle tie-ups and the treadle sequence, 
+   The software allows you to graphically configure the treadle tie-ups and the treadle sequence, 
    and then weave by throwing the shuttle and just pushing the single foot pedeal to get the
    next configuration of the shafts.  The warping, though, must still be done manually!
 
