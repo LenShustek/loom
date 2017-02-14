@@ -1,10 +1,17 @@
-eLoom: an automation system for the Glimakra "Julia" floor loom
- 
-Tying up a loom with treadles and lamms is complicated, and so is the 
-weaving. I have replaced all the treadles and lamms in our Glimakra 
-"Julia" countermarche floor loom with stepper motors that independently 
-operate up to 8 shafts. That not only makes setup and weaving easier, 
-but it also allows patterns that would otherwise not be possible. 
+eLoom: an automation system for the Glimakra "Julia" floor loom 
+
+Tying up a loom with treadles and lamms is complicated, and so is the weaving. 
+So I have replaced all the treadles and lamms in our Glimakra "Julia" 
+countermarche floor loom with stepper motors that independently operate up to 
+8 shafts. That not only makes setup and weaving easier, but it also allows 
+patterns that would otherwise not be possible. 
+
+The tie-ups and treadle sequences for up to 16 simulated treadles are 
+graphically configured on a small screen. You then weave by throwing the 
+shuttle and just pushing the single foot pedeal to get the next configuration 
+of the shafts. The warping, though, must still be done manually! 
+
+For a one-minute video of it in action, see https://www.youtube.com/watch?v=ygZEDzQJMSk
 
 The hardware added to the loom consists of:
  - up to 8 stepper motors, 23HS22-1504S, NEMA 23, 5.4V, 1.5A, 164 oz-in holding torque
