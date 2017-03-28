@@ -13,7 +13,7 @@
     - 1 foot pedal (MPJA 18150 or equiv.)
     - 1 Teensy 3.5 microprocessor, with 512KB flash, 192KB RAM, 4KB EEPROM, and 40 I/O pins
 
-   The software allows you to graphically configure the treadle tie-ups and the treadle sequence, 
+   The software allows you to graphically configure the treadle tie-ups and the treadle sequence,
    and then weave by throwing the shuttle and just pushing the single foot pedeal to get the
    next configuration of the shafts.  The warping, though, must still be done manually!
 
@@ -50,14 +50,24 @@
                                   - better debugging output
                                   - parametrize CW/CCW motor initialization
                                   - highlight the treadle while weaving, not just the line
+   12 Feb 2017, L. Shustek, V1.4  - more interesting light show during weaving
+                                  - make the vertical button during weaving be "undo" to the previous shed
+                                  - allow abort from load/save/erase menu
+   23 Mar 2017, L. Shustek, V1.5  - increase max treadle sequence to 99
+                                  - fix bug when editing the filename extends its length
+                                  - temporarily disable motors during weaving if there is no activity for a few minutes.
+   27 Mar 2017, L. Shustek, V1.6  - display filename on top-level screen, or "unsaved" if pgmg changes are made
+                                  - default to current file in load/save menu
 */
+#define VERSION "1.6"
 
 /* TODO:
     - Invent a more programmatic way to configure treadle sequences with repeat loops.
       Since weaving is limited to one treadle at a time we can use decimal rather than unary
       notation on the narrow display. It doesn't match weaving books, though, so weavers would
       consider that sacriligious!
-      Idea #1: a third programming mode for "treadle loops", in addition to the traditional sequence.
+
+      Idea #1: a programming mode for "treadle loops", in addition to the traditional sequence.
       The notation might be like this, using "Irish Meadows blanket" as an example:
           4x: 5 6
           6x: 6 5
@@ -68,11 +78,12 @@
           4x: 5 6
       When weaving, the "xx" line would be repeated indefinitely until a button is pushed to advance.
       Either this "treadle loop" notation or a reconstructed "treadle sequence" notation could be displayed.
-      The 7-digit display could show how far along in a repeat sequence we are.
+      The big-digit display could show how far along in a repeat sequence we are.
       The file format would have to be elaborated to be able to save and load these looped treadle sequences.
+
+    - Save space by making the tieup[][] matrix be a true bitmap. That would allow more files in the EEPROM.
 */
 
-#define VERSION "1.3"
 #define DEBUG true
 #define HW_TEST false
 
@@ -86,7 +97,7 @@
 
 #define NUM_TREADLES 16 // max 17 will fit on the display currently
 #define NUM_SHAFTS 8
-#define MAX_SEQUENCE 32
+#define MAX_SEQUENCE 99
 
 #define MSEC_PER_ROTATION 1000      // how long we should take for one rotation
 #define uSTEPS_PER_STEP 4           // how many microsteps per step the drivers are configured for (MODE1 high)
@@ -94,6 +105,8 @@
 #define MIN_STEP_uSEC (1000UL * MSEC_PER_ROTATION / STEPS_PER_ROTATION)
 #define DEBOUNCE_MSEC 50
 #define ROTATION_PERCENT (112/2) // what part of a full rotation goes from CENTER to UP or DOWN, nominally
+#define STEPS_PER_LIGHT_CHANGE 64
+#define MINS_BEFORE_MOTOR_DISABLE 10
 
 //**** hardware pin configuration
 
@@ -197,10 +210,9 @@ shaft_status[NUM_SHAFTS] = {
 
 static bool tieup [NUM_SHAFTS] [NUM_TREADLES] =  { // does shaft i go down with treadle j?
    // initialization: a line is all treadles connected to a particular shaft
-   {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+   {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, // initialized to basic weave
    {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-   {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } };
+   /* everything else is 0 */ };
 static byte treadle_sequence[MAX_SEQUENCE]; // treadle sequence for this pattern; values are 0..NUM_TREADLES-1
 #define UNUSED_SEQ 0xff                     // or 0xff signifying "this position is unused"
 static int sequence_size;
@@ -219,17 +231,18 @@ static int sequence_size;
 */
 struct {
    char id[4];       // "cfg" for identification
-   int size;         // size of the config record, including this header
-   int numshafts;    // compile-time config parameters for consistency checking
-   int numtreadles;
-   int maxsequence;
+   int size;         // CONFIG_SIZE: size of the whole config record, including this header
+   byte numshafts;   // compile-time config parameters for consistency checking
+   byte numtreadles;
+   byte maxsequence;
    byte lastfilenum;  // the last file we loaded or saved
+   byte tr_seq_pos;   // the current index into the treadle sequence for that file
    byte unused[15];
    // after this we write the "shaft_status" array, which contains the current shaft configuration data
-} config_hdr;
+} config_hdr = {0 };
 #define CONFIG_SIZE ((int)sizeof(config_hdr) + (int)sizeof(shaft_status))
 
-#define MAX_FILENAME 15
+#define MAX_FILENAME 14
 struct {
    char id[4]; // "fil" for identification
    int size;   // size of the whole file, including this header
@@ -249,6 +262,8 @@ Encoder H_ENC (H_ENC_A, H_ENC_B);
 Encoder V_ENC (V_ENC_A, V_ENC_B);
 long Hold, Vold;  // last encoder values
 #define ENC_STEPS_PER_CLICK 4
+char last_filename[MAX_FILENAME + 1] = {0};
+bool unsaved_file = false;
 
 //**** utility routines
 
@@ -383,8 +398,9 @@ void test_hardware(void) {
          Vold = Vnew; } } }
 
 enum events check_event(void) {
+   // check for a switch or button event; return eNone if none
    for (int i = 0; inpins[i].pin != 0xff; ++i) { //test all inputs
-      // we should be cleverer here and trigger on press, but record to ingore until release
+      // we should be cleverer here: trigger on press, but record to ignore until release
       if (digitalRead(inpins[i].pin) == inpins[i].active_state) { // button pushed
          delay(DEBOUNCE_MSEC);
          while (digitalRead(inpins[i].pin) == inpins[i].active_state) ;  // wait for release
@@ -429,8 +445,9 @@ bool wait_yesno(const char *msg1, const char *msg2) {
    return answer; }
 
 int ask_choice(const char *msg1, const char *msg2, const char *msg3, const char *msg4) {
+   // return 0 if abort, else choice 1..4
    enum events event;
-   int row = 0, numchoices = 2;
+   int row = 0, numchoices = 2, answer = -1;
    lcd.clear();
    center_message(0, msg1);
    center_message(1, msg2);
@@ -441,7 +458,8 @@ int ask_choice(const char *msg1, const char *msg2, const char *msg3, const char 
          center_message(3, msg4);
          ++numchoices; } }
    V_LED(V_ENC_GREEN);
-   while (1) {
+   H_LED(H_ENC_RED);
+   while (answer < 0) {
       lcd.setCursor(10, row); // put cursor in the center of the line
       lcd.blink();
       event = check_event();
@@ -452,11 +470,16 @@ int ask_choice(const char *msg1, const char *msg2, const char *msg3, const char 
          case eVrotR: // down
             if (row < numchoices - 1) ++row;
             break;
-         case ePBV:
-            lcd.noBlink();
-            V_LED(0);
-            return row + 1;
-         default: ; } } }
+         case ePBV:  // green button selects a choice
+            answer = row + 1;
+            break;
+         default:
+            if (event != eNone) answer = 0;  // any other button aborts
+            break; } }
+   lcd.noBlink();
+   V_LED(0);
+   H_LED(0);
+   return answer; }
 
 void lcd_write_dd (int number) {
    lcd.write(number < 10 ? ' ' : '0' + number / 10);
@@ -533,9 +556,11 @@ move_right:
                   --shaft_num_on_bottom; } }
             break;
          case ePBH: // green (left, horizontal) button
+            unsaved_file = true;
             tieup[shaft_num][treadle_num] = true;
             goto move_right;
          case ePBV: // red (right, vertical) button
+            unsaved_file = true;
             tieup[shaft_num][treadle_num] = false;
             goto move_right;
          case ePB1:  // top button: stop programming
@@ -626,12 +651,14 @@ move_down:
                   --sequence_pos_on_top; } }
             break;
          case ePBH: // green or blue (left, horizontal) button
+            unsaved_file = true;
             if (row_select) insert_treadle_sequence(sequence_pos);
             else {
                treadle_sequence[sequence_pos] = treadle_num;  // assign the treadle to this position
                goto move_down; }
             break;
          case ePBV:  // red (right, vertical) button
+            unsaved_file = true;
             if (row_select) delete_treadle_sequence(sequence_pos);
             else {
                if (treadle_sequence[sequence_pos] == treadle_num)  // if we're on this treadle
@@ -665,7 +692,7 @@ void dump_file (const char *msg) {
    Serial.println(); }
 
 void dump_shaft_state(void) {
-   static char *position_name[3] = {  " CT ", " UP ", " DN " };
+   static const char *position_name[3] = {  " CT ", " UP ", " DN " };
    Serial.println("shaft state:");
    for (int sh = 0; sh < NUM_SHAFTS; ++sh) {
       Serial.print(sh);  Serial.print(position_name[shaft_status[sh].shaft_position]);
@@ -686,14 +713,14 @@ void erase_EEPROM(void) {
       for (int loc = 0; loc < EEPROM_SIZE; ++loc)
          EEPROM.update(loc, 0); } }
 
-void write_config(int filenum) {
+void write_config(void) {
    int toloc = 0;
    strcpy(config_hdr.id, "cfg");
    config_hdr.size = CONFIG_SIZE;
    config_hdr.numshafts = NUM_SHAFTS;
    config_hdr.numtreadles = NUM_TREADLES;
    config_hdr.maxsequence = MAX_SEQUENCE;
-   config_hdr.lastfilenum = filenum;
+   // we expect lastfilenum and tr_seq_ndx to have been set
    memset(config_hdr.unused, 0, sizeof(config_hdr.unused));
    write_EEPROM(&toloc, (char *) &config_hdr, sizeof(config_hdr));
    write_EEPROM(&toloc, (char *) shaft_status, sizeof(shaft_status));
@@ -711,8 +738,10 @@ void read_config(void) {
       read_EEPROM(&fromloc, (char *) shaft_status, sizeof(shaft_status)); // read shaft data
       if (DEBUG) Serial.println("***config read");
       if (DEBUG) dump_shaft_state(); }
-   else write_config(0); // bad config in EEPROM: rewrite it
-}
+   else {
+      write_config(); // bad config in EEPROM: rewrite it
+      write_file(0); // write the "plain weave" file
+   } }
 
 void cleanup_filename (char *name) {
    int i;
@@ -738,6 +767,9 @@ void write_file (int filenum) {
    write_EEPROM(&toloc, (char*) &file_hdr, sizeof(file_hdr));
    write_EEPROM(&toloc, (char*) tieup, sizeof(tieup));
    write_EEPROM(&toloc, (char*) treadle_sequence, sizeof(treadle_sequence));
+   config_hdr.lastfilenum = filenum;
+   strcpy(last_filename, file_hdr.filename);
+   unsaved_file = false;
    if (DEBUG) dump_file("file saved:"); }
 
 void read_file_hdr (int filenum) {
@@ -762,6 +794,9 @@ void read_file_data (int filenum) {
    read_EEPROM(&fromloc, (char*) tieup, sizeof(tieup));
    read_EEPROM(&fromloc, (char*) treadle_sequence, sizeof(treadle_sequence));
    cleanup_treadle_sequence();
+   config_hdr.lastfilenum = filenum;
+   strcpy(last_filename, file_hdr.filename);
+   unsaved_file = false;
    if (DEBUG) dump_file("file read:"); }
 
 void display_files (int filenum) {
@@ -790,17 +825,25 @@ void loadsave_files (void) {
    bool row_select = true; // are we selecting the whole row by having the cursor on the far left?
    bool save;
    enum events event;
+   char string[25];
 
    choice = ask_choice("load file?", "save file?", "erase memory?", 0);
+   if (choice == 0)
+      return;
    if (choice == 3) {
       erase_EEPROM();
       return; }
-   save = choice == 2;
+   save = choice == 2;  // choice is either 1 for load, or 2 for save
+
+   // highlight the last file we loaded or saved on line 2, maybe
+   filenum = config_hdr.lastfilenum < MAX_FILES ? config_hdr.lastfilenum : 0;
+   filenum_on_top = filenum <= 2 ? 0 : filenum - 2;
+
    row_select = true;
    display_files(filenum_on_top);
    read_file_hdr(filenum);
    while (1) {
-      H_LED(save ? H_ENC_GREEN : 0);
+      H_LED(save && row_select ? H_ENC_GREEN : 0);
       V_LED(save ? (row_select ? V_ENC_RED : V_ENC_BLUE) : V_ENC_GREEN);
       lcd.setCursor(row_select ? 0 : 3 + charnum, filenum - filenum_on_top);
       if (row_select) {
@@ -829,10 +872,10 @@ void loadsave_files (void) {
                   lcd.blink(); }
                else if (charnum < MAX_FILENAME) {
                   ++charnum;
-                  if (file_hdr.filename[charnum] == '\0') // if we're going beyond the end
-                     file_hdr.filename[charnum] = ' '; // change to a blank
-                  file_hdr.filename[charnum + 1] = '\0'; // and make a new end
-               } }
+                  if (file_hdr.filename[charnum] == '\0') { // if we're going beyond the end
+                     file_hdr.filename[charnum] = ' ';        // change NUL to a blank
+                     file_hdr.filename[charnum + 1] = '\0';   // and make a new NUL end
+                  } } }
             break;
          case eVrotR:  // move down
             if (!save || row_select) {
@@ -868,8 +911,9 @@ update_letter:
                if (row_select) { // write this file
                   cleanup_filename(file_hdr.filename);
                   write_file(filenum);
-                  info_message("file saved:", file_hdr.filename);
-                  write_config(filenum); // record this file number in EEPROM
+                  sprintf (string, "file %d saved", filenum + 1);
+                  info_message(string, file_hdr.filename);
+                  write_config(); // record this file number in EEPROM
                   goto exit_loadsave; } }
             break;
          case ePBV:  // right (vertical) button
@@ -877,12 +921,14 @@ update_letter:
                if (!row_select) { // name entry: go to next char
                   if (charnum < MAX_FILENAME) ++charnum; }
                else { // abort writing
+                  cleanup_filename(file_hdr.filename);
                   info_message("file save aborted", 0);
                   goto exit_loadsave; } }
             else { // load file
                read_file_data(filenum);
-               info_message("file loaded:", file_hdr.filename);
-               write_config(filenum); // record this file number in EEPROM
+               sprintf (string, "file %d loaded", filenum + 1);
+               info_message(string, file_hdr.filename);
+               write_config(); // record this file number in EEPROM
                goto exit_loadsave; }
             break;
          case ePB1:  // other buttons: exit
@@ -907,30 +953,34 @@ bool using_shaft(int shaft) {  // does any used treadle tie up to this shaft?
 
 void do_steps() {  // do queued-up steps for all motors
    bool step_done;
-   digitalWrite(H_ENC_BLUE, LOW);
-   digitalWrite(V_ENC_BLUE, LOW);
+   unsigned int light_counter = STEPS_PER_LIGHT_CHANGE, light_index = 0; // for an amusing light display while weaving
+   static byte light_sequence[] = {H_ENC_RED, V_ENC_GREEN, H_ENC_BLUE, V_ENC_RED, H_ENC_GREEN, V_ENC_BLUE };
+
    assert(digitalRead(MOTOR_FAULT) == HIGH, "motor failure");
    do {
       step_done = false;
-      for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
+      for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) { // figure out which shafts to step
          if (shaft_status[shaft].steps_to_move < 0) { // moving down
             digitalWrite(MOTOR_DIR, 1 - shaft_hardware[shaft].clockwise); // set direction to "down"
             ++shaft_status[shaft].steps_to_move; // one fewer to do
-            //Serial.print(shaft); Serial.println(" shaft down");
             goto do_step; }
          if (shaft_status[shaft].steps_to_move > 0) { // moving up
             digitalWrite(MOTOR_DIR, shaft_hardware[shaft].clockwise); // set direction to "up"
             --shaft_status[shaft].steps_to_move;  // one fewer to do
-            //Serial.print(shaft); Serial.println(" shaft up");
 do_step:
             digitalWrite(shaft_hardware[shaft].pin_step, HIGH); // do a step on this shaft
             delayMicroseconds(5);
             digitalWrite(shaft_hardware[shaft].pin_step, LOW);
             delayMicroseconds(5);
             step_done = true; } }
-      if (step_done)
+      if (step_done) {
+         if (++light_counter >= STEPS_PER_LIGHT_CHANGE) {
+            light_counter = 0;
+            digitalWrite(light_sequence[light_index], LED_OFF);
+            if (++light_index >= sizeof(light_sequence)) light_index = 0;
+            digitalWrite(light_sequence[light_index], LED_ON); }
          delayMicroseconds(MIN_STEP_uSEC);
-      assert(digitalRead(MOTOR_FAULT) == HIGH, "motor failure"); }
+         assert(digitalRead(MOTOR_FAULT) == HIGH, "motor failure"); } }
    while (step_done);
    H_LED(0);
    V_LED(0); }
@@ -1021,7 +1071,7 @@ void do_calibration(void) {  // calibrate the center, bottom, and top positions 
             shaft_status[shaft].steps_to_move = -shaft_status[shaft].steps_to_up; // return it to the center
             do_steps(); // (it will be the only motor to move)
          } } }
-   write_config(config_hdr.lastfilenum); // write the shaft calibration data
+   write_config(); // write the shaft calibration data
    info_message("calibration saved", 0); }
 
 void center_all_shafts(void) {
@@ -1039,24 +1089,27 @@ void center_all_shafts(void) {
       shaft_status[shaft].shaft_position = SHAFT_CENTER; }
    do_steps(); }
 
-void weave (void) {
-   int position = 0;
+void weave (void) {  // enter weaving mode
    int shuttle_count = 0;
    enum events event;
    bool before_movement = true; // we haven't yet moved to the position shown on the screen
+   unsigned long last_weave_time;
+   bool motors_on;
 
    digitalWrite(MOTOR_ENB, LOW);  // enable the motors
+   motors_on = true;
+   last_weave_time = millis();
    assert(digitalRead(MOTOR_FAULT) == HIGH, "motor failure");
    if (wait_yesno("shed must be closed", "do calibration?"))
       do_calibration();
    Serial.println("weaving");
    lcd.clear();
    lcd.blink();
-   V_LED(V_ENC_BLUE);
-   display_treadle_sequence(position, false);  // show the position we are about to move to
+   display_treadle_sequence(config_hdr.tr_seq_pos, false);  // show the position we are about to move to
    lcd.setCursor(0, 0);  // indicate that by putting the cursor before the sequence number
    led7_shownum(shuttle_count, true);
-   while (1) {// do the treadle sequence
+   while (1) {// do the treadle sequence forever
+      V_LED(V_ENC_BLUE); // signal "ok to change rows"
       event = check_event();
       switch (event) {
          case ePB1:  // any other button stops the weaving
@@ -1066,41 +1119,54 @@ void weave (void) {
             V_LED(0);
             led7_turnoff();       // turn off the number display
             center_all_shafts();  // close the shed
-            digitalWrite(MOTOR_ENB, HIGH);  // and disable the motors
+            digitalWrite(MOTOR_ENB, HIGH);  // disable the motors
+            write_config(); // record the updated treadle sequence position
             return;
          case ePEDAL:  // next in treadle sequence
+do_pedal:
+            if (!motors_on) {
+               digitalWrite(MOTOR_ENB, LOW);  // enable the motors again
+               delay(500);  // delay for power supply ramp
+               motors_on = true; }
+            last_weave_time = millis();
             if (!before_movement) {  // we need to move to a new position
-               if (++position >= sequence_size) position = 0;
-               display_treadle_sequence(position, false);
+               if (++config_hdr.tr_seq_pos >= sequence_size) config_hdr.tr_seq_pos = 0;
+               display_treadle_sequence(config_hdr.tr_seq_pos, false);
                led7_shownum(++shuttle_count, true); }
-            if (treadle_sequence[position] != UNUSED_SEQ) {
-               lcd.setCursor(3 + treadle_sequence[position], 0); // indicate that we will have moved to that position
+            if (treadle_sequence[config_hdr.tr_seq_pos] != UNUSED_SEQ) {
+               lcd.setCursor(3 + treadle_sequence[config_hdr.tr_seq_pos], 0); // indicate that we will have moved to that position
                // by highlighting the treadle itself
-               do_treadle(treadle_sequence[position]); }
+               do_treadle(treadle_sequence[config_hdr.tr_seq_pos]); }
             before_movement = false;
             break;
          case ePB4: // clear shuttle counter
             shuttle_count = 0;
             led7_shownum(shuttle_count, true);
             break;
-         case eVrotL:   // go up (backwards) in treadle sequence
-            if (--position < 0) position = sequence_size - 1;
+         case ePBV:
+         case eVrotL:   // go up (backward) in treadle sequence
+            if (--config_hdr.tr_seq_pos < 0) config_hdr.tr_seq_pos = sequence_size - 1;
             if (shuttle_count > 0) --shuttle_count;
             goto new_position;
-         case eVrotR:  // go down (forwards) in treadle sequence
-            if (++position >= sequence_size) position = 0;
+         case eVrotR:  // go down (forward) in treadle sequence
+            if (++config_hdr.tr_seq_pos >= sequence_size) config_hdr.tr_seq_pos = 0;
             ++shuttle_count;
 new_position:
             before_movement = true;
-            display_treadle_sequence(position, false);
-            lcd.setCursor(0, 0); // indicate that we are display a position we aren't at
+            display_treadle_sequence(config_hdr.tr_seq_pos, false);
+            lcd.setCursor(0, 0); // indicate that we are displaying a position we aren't at
             led7_shownum(shuttle_count, true);
+            if (event == ePBV) goto do_pedal;
             break;
-         default: ; } } }
+         default:
+            if (motors_on && (millis() - last_weave_time) > MINS_BEFORE_MOTOR_DISABLE * 1000L * 60L) {
+               digitalWrite(MOTOR_ENB, HIGH);  // disable the motors because of inactivity
+               motors_on = false;; } } } }
 
 //**** initialization
 
 void setup(void) {
+   char string[25];
    #if DEBUG
    Serial.begin(115200);
    //while (!Serial) ; // hangs if serial not connected
@@ -1138,8 +1204,11 @@ void setup(void) {
    test_hardware();
    #endif
    if (DEBUG) {
+      Serial.print("config size: "); Serial.println(CONFIG_SIZE);
+      Serial.print("file size: "); Serial.println(FILE_SIZE);
+      Serial.print("max files: "); Serial.println(MAX_FILES);
       if (digitalRead(PB4) == LOW) // magic: if black button is down during powerup
-         erase_EEPROM();            // then maybe erase the memory
+         erase_EEPROM();            // then offer to erase the memory
       dump_file( "initial state");
       Serial.print("config size:"); Serial.println(CONFIG_SIZE);
       Serial.print("file size:"); Serial.println(FILE_SIZE); }
@@ -1147,7 +1216,8 @@ void setup(void) {
    if (config_hdr.lastfilenum < MAX_FILES) {
       read_file_hdr(config_hdr.lastfilenum);
       read_file_data(config_hdr.lastfilenum);
-      info_message("file reloaded:", file_hdr.filename); } }
+      sprintf (string, "file %d reloaded", config_hdr.lastfilenum + 1);
+      info_message(string, file_hdr.filename); } }
 
 //**** the main loop
 
@@ -1157,6 +1227,7 @@ void loop(void) {
    lcd.clear();
    sprintf(string, "eLoom V%s", VERSION);
    center_message(0, string);
+   center_message(3, unsaved_file ? "<unsaved file>" : last_filename);
    do {
       event = check_event(); }
    while (event == eNone);
@@ -1164,7 +1235,6 @@ void loop(void) {
       case ePB1:
          program_tieups();
          program_treadle_sequence();
-         lcd.clear();
          break;
       case ePB2:
          weave();
