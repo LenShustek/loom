@@ -19,6 +19,10 @@
 
    See https://github.com/LenShustek/loom for more information about this project.
 
+   When you install a DRV8825 stepper motor driver, adjust the pot on the board so that
+   there is 0.75V at the body of the pot, which is for 1.5A drive current to the motor.
+   The motor doesn't have to be on when you that.
+
    ------------------------------------------------------------------------------------------------------
    Copyright (c) 2017, Len Shustek
 
@@ -42,11 +46,11 @@
 ******************************************************************************************************/
 /*
    23 Jan 2017, L. Shustek, V1.0, - first version
-   31 Jan 2017, L. Shustek, V1.1, - fix treadle sequence changes during weaving,
+   31 Jan 2017, L. Shustek, V1.1, - fix treadle sequence changes during weaving
                                   - clean up filename handling and display
     4 Feb 2017, L. Shustek, V1.2  - add motor fault detection
                                   - fix filename bug
-                                  - change schematic to match driver physical layout;
+                                  - change schematic to match driver physical layout
                                   - clean up compiler warnings
    10 Feb 2017, L. Shustek, V1.3  - separate motor hardware config, and don't write it to memory
                                   - better debugging output
@@ -57,21 +61,28 @@
                                   - allow abort from load/save/erase menu
    23 Mar 2017, L. Shustek, V1.5  - increase max treadle sequence to 99
                                   - fix bug when editing the filename extends its length
-                                  - temporarily disable motors during weaving if there is no activity for a few minutes.
+                                  - temporarily disable motors during weaving if there is no activity for a few minutes
    27 Mar 2017, L. Shustek, V1.6  - display filename on top-level screen, or "unsaved" if pgmg changes are made
                                   - default to current file in load/save menu
                                   - exit from program mode if any other button is pushed
    15 Jun 2017, L. Shustek, V1.7  - fix bug: exiting weaving mode after motors had timed out didn't return
                                     the shafts to the neutral position
     8 Jan 2018, L. Shustek, V1.8  - change "zero" button to "backup" button in weave mode
-                                  - display frame numbers instead of X in tieup screen
-                                  - display treadle numbers instead of X in treadle sequence screen
+                                  - display frame numbers instead of X on the tieup screen
+                                  - display treadle numbers instead of X on the treadle sequence screen
                                   - fix bug: backing up weave at the first treadle position failed
-   28 Oct 2018, L. Shustek, V1.9  - add the option to do "Tabby" between each step of a treadle sequence
+   28 Oct 2018, L. Shustek, V1.9  - add an option to do "Tabby" between each step of a treadle sequence
+                                    if the first two treadles are otherwise unused
     3 Jan 2019, L. Shustek, V1.10 - during calibration, show the distance the frame moves
+                                  - add a file option to reverse the fabric by inverting the tieups
+   13 Jun 2020, L. Shustek, V1.11 - fix bug: "alternate tabby" wasn't working for shafts other than 0 and 1
+                                  - fix bug: always set FILE_TABBY one way or the other when changing programming
+   10 Oct 2020, L. Shustek, V1.12 - allow "weave" button to abort the calibration process
+                                  - during calibration, show the previously set calibration point
+                                  - increase debounce delay because our switches are really noisy
 
 */
-#define VERSION "1.10"
+#define VERSION "1.12"
 
 /***** Enhancement ideas:
 
@@ -98,7 +109,7 @@
       Or instead: use an SD card for files, and to hell with optimizing the size to fit in the 4K EEPROM!
 */
 
-#define DEBUG true
+#define DEBUG false
 #define HW_TEST false
 
 #include <Encoder.h>
@@ -119,8 +130,8 @@
 #define STEPS_PER_ROTATION (200 * uSTEPS_PER_STEP)  // the stepper motors have 1.8 degree "full" steps; 360/1.8=200
 #define HUNDRETHINCHES_PER_ROTATION ((int)(0.75*3.14*100.0+0.5))  // we use a 3/4" drive gear
 #define MIN_STEP_uSEC (1000UL * MSEC_PER_ROTATION / STEPS_PER_ROTATION)
-#define DEBOUNCE_MSEC 50
-#define ROTATION_PERCENT (112/2) // what part of a full rotation goes from CENTER to UP or DOWN, nominally
+#define DEBOUNCE_MSEC 100
+#define ROTATION_PERCENT (130/2) // what part of a full rotation goes from CENTER to UP or DOWN, nominally
 #define STEPS_PER_LIGHT_CHANGE 64
 #define MINS_BEFORE_MOTOR_DISABLE 10
 
@@ -163,7 +174,7 @@
 
 enum events { // input events
    eNone,
-   ePB1, ePB2, ePB3, ePB4,  // big pushbuttons
+   ePB1, ePB2, ePB3, ePB4,  // big pushbuttons: program, weave, load/save, unweave
    ePBH, ePBV,              // horizontal and vertical encoder pushbuttons
    ePEDAL,                  // foot pedal
    eHrotL, eHrotR,          // horizontal encoder rotation
@@ -265,7 +276,8 @@ struct {
    char id[4]; // "fil" for identification
    int16_t size;   // size of the whole file, including this header
    byte flags;
-#define FILE_TABBY 0x01  // use Tabby 1/2 between each treadle step
+#define FILE_TABBY 0x01         // use Tabby 1/2 between each treadle step
+#define FILE_INVERT_TIEUPS 0x02 // invert the top and bottom of the fabric
    byte unused;
    byte checksum;
    char filename[MAX_FILENAME + 1]; // null-terminated string
@@ -513,7 +525,8 @@ void display_tieups(int /*starting*/ shaft, bool title) {
    int row = 3; // start from bottom to match weaving pattern books
    lcd.clear();
    if (title) {
-      center_message(row, "Treadle tie-ups");
+      center_message(row, file_hdr.flags & FILE_INVERT_TIEUPS ?
+                     "Treadle tie-ups, rev" : "Treadle tie-ups");
       --row; }
    for (; row >= 0 && shaft < NUM_SHAFTS; --row, ++shaft) {
       lcd.setCursor(0, row);
@@ -599,7 +612,7 @@ move_right:
 
 bool using_shaft(int shaft) {  // does any used treadle tie up to this shaft?
    if ((file_hdr.flags & FILE_TABBY) &&
-         (shaft == 0 || shaft == 1)) return true;  // use the first two in "alternate tabby 1/2" mode
+         (tieup[shaft][0] || tieup[shaft][1])) return true;  // used by treadle 0 or 1 in "alternate tabby 1/2" mode
    for (int pos = 0; pos < sequence_size; ++pos)
       if (treadle_sequence[pos] != UNUSED_SEQ && tieup[shaft][treadle_sequence[pos]])
          return true;
@@ -710,11 +723,15 @@ move_down:
             lcd.noBlink();
             lcd.noCursor();
             cleanup_treadle_sequence();
-            // If the new or modified program doesn't use the first two treadles at all, see if
-            // the weaver wants us to alternate using them between all the other treadle steps
-            if (did_something && ((file_hdr.flags & FILE_TABBY) || (!using_treadle(0) && !using_treadle(1)))
-                  && wait_yesno(0, "Alternate 1/2 Tabby?"))
-               file_hdr.flags |= FILE_TABBY;
+            if (did_something) {
+               // If the new or modified program doesn't use the first two treadles at all, see if
+               // the weaver wants us to alternate using them between all the other treadle steps
+               if (!using_treadle(0) && !using_treadle(1) && wait_yesno(0, "Alternate 1/2 Tabby?"))
+                  file_hdr.flags |= FILE_TABBY;
+               else file_hdr.flags &= ~FILE_TABBY;
+               if (wait_yesno(0, "Reverse top/bottom?"))
+                  file_hdr.flags |= FILE_INVERT_TIEUPS;
+               else file_hdr.flags &= ~FILE_INVERT_TIEUPS; }
             return event; } } }
 
 //***********************************************************************
@@ -1032,7 +1049,7 @@ void do_treadle(int treadle) { // queue up and then do the shaft motion for a tr
    #endif
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
       if (using_shaft(shaft)) {  // if we ever use this shaft in our pattern, then move it up or down
-         if ( tieup[shaft] [treadle]) { // this shaft should go down
+         if ( (file_hdr.flags & FILE_INVERT_TIEUPS ? 1 : 0) ^ tieup[shaft][treadle]) { // this shaft should go down
             if (shaft_status[shaft].shaft_position == SHAFT_UP)
                shaft_status[shaft].steps_to_move = -shaft_status[shaft].steps_to_down - shaft_status[shaft].steps_to_up;
             if (shaft_status[shaft].shaft_position == SHAFT_CENTER)
@@ -1047,10 +1064,20 @@ void do_treadle(int treadle) { // queue up and then do the shaft motion for a tr
             Serial.print(" moves "); Serial.println(shaft_status[shaft].steps_to_move); } } }
    do_steps();
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) // record the ending position of the shafts
-      shaft_status[shaft].shaft_position = tieup[shaft] [treadle] ? SHAFT_DOWN : SHAFT_UP; }
+      shaft_status[shaft].shaft_position = ((file_hdr.flags & FILE_INVERT_TIEUPS ? 1 : 0) ^ tieup[shaft] [treadle]) ? SHAFT_DOWN : SHAFT_UP; }
 
-int get_calibration(int shaft, const char *msg, bool allow_abort) {  // calibrate the center, bottom, or top position of a shaft
-   // returns the number of steps down (negative) or up (positive) we went, or 999 if aborted
+#define CALIB_SKIP 999
+#define CALIB_ABORT 998
+
+void format_distance (char *str, int steps) {
+   int hundredthinches = (int)(((long)steps * HUNDRETHINCHES_PER_ROTATION) / STEPS_PER_ROTATION);
+   if (hundredthinches < 0) // show the distance the frame moved up or down, in inches
+      sprintf(str, "-%d.%02d\"", (-hundredthinches) / 100, -hundredthinches % 100);
+   else sprintf(str, "+%d.%02d\"", hundredthinches / 100, hundredthinches % 100); }
+
+int get_calibration(int shaft, const char *msg, int old_steps, bool centering) {  // calibrate the center, bottom, or top position of a shaft
+   // returns the number of steps down (negative) or up (positive) we went,
+   // or CALIB_SKIP (if centering) to skip this shaft, or CALIB_ABORT to abort calibration altogether
    enum events event;
    int steps = 0, stepadj;
    char str[25];
@@ -1059,12 +1086,16 @@ int get_calibration(int shaft, const char *msg, bool allow_abort) {  // calibrat
    center_message(0, str);
    sprintf(str, "%s, push green", msg);
    center_message(1, str);
-   if (allow_abort) {
-      center_message(3, "red button skips");
+   if (centering) {
+      center_message(2, "red button skips");
       H_LED(H_ENC_RED); }
+   center_message(3, "\"weave\" aborts");
    V_LED(V_ENC_GREEN);
    while (1) {
       event = check_event();
+      if (event == ePB2) {
+         steps = CALIB_ABORT;
+         goto do_exit; }
       if (event == eVrotR) {
          digitalWrite(MOTOR_DIR, 1 - shaft_hardware[shaft].clockwise);  // set direction to "down"
          stepadj = -1;
@@ -1080,13 +1111,14 @@ do_move:
             digitalWrite(shaft_hardware[shaft].pin_step, LOW);
             delayMicroseconds(MIN_STEP_uSEC);
             steps += stepadj; }
-         int hundredthinches = (int)(((long)steps * HUNDRETHINCHES_PER_ROTATION) / STEPS_PER_ROTATION);
-         if (hundredthinches < 0) // show the distance the frame moved up or down, in inches
-            sprintf(str, "-%d.%02d\"", (-hundredthinches) / 100, -hundredthinches % 100);
-         else sprintf(str, "+%d.%02d\"", hundredthinches / 100, hundredthinches % 100);
-         center_message(2, str); }
-      if (allow_abort && event == ePBH) {
-         steps = 999;
+         if (!centering) {
+            char old_distance[8], distance[8];
+            format_distance(old_distance, old_steps);
+            format_distance(distance, steps);
+            sprintf(str, "%s -> %s", old_distance, distance);
+            center_message(2, str); } }
+      if (centering && event == ePBH) {
+         steps = CALIB_SKIP;
          goto do_exit; }
       if (event == ePBV) {
 do_exit:
@@ -1097,23 +1129,33 @@ do_exit:
          return steps; } } }
 
 void do_calibration(void) {  // calibrate the center, bottom, and top positions of all shafts in use
-   int shaft;
-   for (shaft = 0; shaft < NUM_SHAFTS; ++shaft) {  // initialize all shafts as centered and nominal
-      shaft_status[shaft].shaft_position = SHAFT_CENTER;
-      shaft_status[shaft].steps_to_down = shaft_status[shaft].steps_to_up = NOMINAL_STEPS;
-      shaft_status[shaft].steps_to_move = 0; }
+   int shaft, steps;
    for (shaft = 0; shaft < NUM_SHAFTS; ++shaft) {  // now ask to recalibrate
       if (using_shaft(shaft)) {                    //  the shaft is in use for this pattern
-         if (get_calibration(shaft, "center", true) != 999) { // calibrating this shaft
-            shaft_status[shaft].steps_to_down = -get_calibration(shaft, "down", false);
+         steps = get_calibration(shaft, "center", 0, true);
+         shaft_status[shaft].shaft_position = SHAFT_CENTER;
+         if (steps == CALIB_ABORT) goto abort;
+         if (steps != CALIB_SKIP) { // calibrating this shaft
+            steps = get_calibration(shaft, "down", -shaft_status[shaft].steps_to_down, false);
+            if (steps == CALIB_ABORT) goto abort;
+            shaft_status[shaft].steps_to_down = -steps;
             shaft_status[shaft].steps_to_move = shaft_status[shaft].steps_to_down; // return it to the center
             do_steps();  // (it will be the only motor to move)
-            shaft_status[shaft].steps_to_up = get_calibration(shaft, "up", false);
+            steps = get_calibration(shaft, "up", shaft_status[shaft].steps_to_up, false);
+            if (steps == CALIB_ABORT) goto abort;
+            shaft_status[shaft].steps_to_up = steps;
             shaft_status[shaft].steps_to_move = -shaft_status[shaft].steps_to_up; // return it to the center
             do_steps(); // (it will be the only motor to move)
-         } } }
+         } }
+      else { // not using this shaft: assume centered, and leave the previous calibration
+         shaft_status[shaft].shaft_position = SHAFT_CENTER;
+         shaft_status[shaft].steps_to_move = 0; } }
    write_config(); // write the shaft calibration data
-   info_message("calibration saved", 0); }
+   info_message("calibration saved", 0);
+   return;
+abort:
+   read_config(); // reread the existing config
+   info_message("calibration aborted", 0); }
 
 void center_all_shafts(void) {
    for (int shaft = 0; shaft < NUM_SHAFTS; ++shaft) {
@@ -1307,5 +1349,3 @@ void loop(void) {
          break;
       default: ; } }
 //*
-
-
