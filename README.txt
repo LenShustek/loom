@@ -8,7 +8,7 @@ patterns that would otherwise not be possible.
 
 The tie-ups and treadle sequences for up to 16 simulated treadles are 
 graphically configured on a small screen. You then weave by throwing the 
-shuttle and just pushing the single foot pedeal to get the next configuration 
+shuttle and just pushing the single foot pedal to get the next configuration 
 of the shafts. The warping, though, must still be done manually! 
 
 For a one-minute video of it in action, see https://www.youtube.com/watch?v=ygZEDzQJMSk
@@ -25,3 +25,10 @@ The hardware added to the loom consists of:
    - 4 general-purpose pushbuttons (MPJA 32730 or equiv.)
    - 1 attached foot pedal (MPJA 18150 or equiv.)
    - 1 Teensy 3.5 microprocessor, with 512KB flash, 192KB RAM, 4KB EEPROM, and 40 I/O pins
+   
+Len Shustek, January 2017
+
+October 2020 update: After yeoman service for 3+ years, the plug-in breadboards with the
+motor drivers started failing because the high current had deteriorated the contacts.
+So I designed a proper printed circuit board replacement that is working great.
+The design is in the motordriver subdirectory of this repository.
